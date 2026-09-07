@@ -41,7 +41,7 @@ El nodo principal (`Stream_node.py`) es altamente configurable mediante parámet
 ## 🛠️ Requisitos Previos
 
 - **ROS** (Recomendado Noetic en Ubuntu 20.04)
-- **Cámara RGB-D** compatible con ROS (ej. Xbox Kinect) con sus respectivos drivers (ej. `freenect_launch`).
+- **Cámara RGB-D** compatible con ROS (ej. Xbox Kinect) con sus respectivos drivers (Se recomienda el uso de `openni_launch`, no de `freenect_launch`).
 - **Dependencias de Python:**
   - `rospy`, `cv_bridge`
   - `opencv-python` (`cv2`)
