@@ -201,15 +201,18 @@ class MediapipeStreaming:
                                                          self.objectron_model, focal_length, principal_point, None if image_size=='None' else image_size)
 
     def newKeypoint(self, landmark:NormalizedLandmark, number:int, name:str) -> Keypoint:
-        """ Crea y asigna valores a un nuevo keypoint, calculando su profundidad desde la Kinect """
+        """ Crea y asigna valores a un nuevo keypoint, calculando sus coordenadas 3D en metros desde la Kinect """
 
         new_keypoint = Keypoint()
+        new_keypoint.v = landmark.visibility
+
+        # Por defecto guardamos los valores crudos por si no hay profundidad válida
         new_keypoint.x = landmark.x
         new_keypoint.y = landmark.y
         new_keypoint.z = landmark.z
-        new_keypoint.v = landmark.visibility
+        new_keypoint.depth = 0.0
 
-        # --- EXTRACCIÓN DE PROFUNDIDAD (DEL TÓPICO DE LA KINECT) ---
+        # --- EXTRACCIÓN DE PROFUNDIDAD Y CONVERSIÓN A METROS ---
         if hasattr(self, 'current_depth_image'):
             # Se saca la resolución de la imagen (suele ser 480x640)
             height, width = self.current_depth_image.shape
@@ -222,14 +225,36 @@ class MediapipeStreaming:
             px = max(0, min(px, width - 1))
             py = max(0, min(py, height - 1))
             
-            # Leer la profundidad en el píxel
-            depth_val = self.current_depth_image[py, px]
+            # --- CORRECCIÓN DE RUIDO DE BORDE (PARALLAX) ---
+            # En lugar de leer un solo píxel (que en el codo suele fallar y dar la profundidad de la pared de fondo),
+            # extraemos una ventana de 5x5 alrededor del punto y tomamos la mediana de los valores válidos.
+            min_y, max_y = max(0, py - 2), min(height, py + 3)
+            min_x, max_x = max(0, px - 2), min(width, px + 3)
+            window = self.current_depth_image[min_y:max_y, min_x:max_x]
             
-            # Convertir milímetros a metros
-            if depth_val > 0:
-                new_keypoint.depth = float(depth_val) / 1000.0
+            valid_depths = window[window > 0]
+            if len(valid_depths) > 0:
+                # Usamos el percentil 30 o la mediana para agarrarnos al brazo (más cercano) y evitar el fondo
+                depth_val = np.percentile(valid_depths, 30)
             else:
-                new_keypoint.depth = 0.0 # 0.0 indica sombra infrarroja o punto ciego
+                depth_val = 0
+            
+            # Convertir milímetros a metros y aplicar modelo Pinhole
+            if depth_val > 0:
+                z_m = float(depth_val) / 1000.0
+                new_keypoint.depth = z_m
+                
+                # Parámetros ópticos aproximados de Kinect (para 640x480)
+                # TODO: En el futuro, suscribirse a /camera/rgb/camera_info
+                fx, fy = 525.0, 525.0
+                cx, cy = 320.0, 240.0
+                
+                # Ecuación estenopeica (Pinhole camera model) para obtener X, Y en metros
+                u = landmark.x * width
+                v = landmark.y * height
+                new_keypoint.x = (u - cx) * z_m / fx
+                new_keypoint.y = (v - cy) * z_m / fy
+                new_keypoint.z = z_m
 
         # Asignar número y nombre al keypoint
         new_keypoint.keypoint_number = number
@@ -304,14 +329,7 @@ class MediapipeStreaming:
 
         if faceResults.face_landmarks:
             for i in range(len(faceResults.face_landmarks.landmark)):
-                new_keypoint = Keypoint()
-                new_keypoint.x = faceResults.face_landmarks.landmark[i].x
-                new_keypoint.y = faceResults.face_landmarks.landmark[i].y
-                new_keypoint.z = faceResults.face_landmarks.landmark[i].z
-                new_keypoint.keypoint_number = i+1
-                new_keypoint.keypoint_name = f'FACE_KEYPOINT_{i+1}'
-
-                face_msg.keypoints.append(new_keypoint)
+                face_msg.keypoints.append(self.newKeypoint(faceResults.face_landmarks.landmark[i], i+1, f'FACE_KEYPOINT_{i+1}'))
 
             self.face_pub.publish(face_msg)
 
