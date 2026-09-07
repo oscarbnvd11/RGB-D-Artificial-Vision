@@ -34,9 +34,10 @@ import message_filters # type: ignore
 from cv_bridge import CvBridge # type: ignore
 import rospy, cv2  # type: ignore
 import numpy as np # type: ignore
+import traceback
 from termcolor import colored # type: ignore
 from typing import Optional
-from sensor_msgs.msg import CompressedImage, Image # type: ignore
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image # type: ignore
 
 # Importar módulos de MediaPipe
 from mediapipe.python.solutions import drawing_utils, drawing_styles, holistic, face_detection, objectron # type: ignore
@@ -100,9 +101,22 @@ class MediapipeStreaming:
         self.enable_face_detection = rospy.get_param('~enable_face_detection', False)
         self.enable_objectron      = rospy.get_param('~enable_objectron', False)
         self.objectron_model       = rospy.get_param('~objectron_model', 'Shoe')
+        self.publish_debug_image   = rospy.get_param('~publish_debug_image', False)
+        self.debug_every_n_frames  = max(1, rospy.get_param('~debug_every_n_frames', 5))
+        self.debug_scale            = min(1.0, max(0.1, rospy.get_param('~debug_scale', 0.5)))
+        self.debug_frame_count      = 0
 
         # Leer parámetros de entrada (Kinect a través de ROS)
         self.input_topic = rospy.get_param('~input_topic', '/camera/rgb/image_raw/compressed')
+        # Este nodo usa las coordenadas RGB de MediaPipe para consultar depth;
+        # por eso el mapa debe estar registrado/alineado con la cámara RGB.
+        self.depth_topic = rospy.get_param('~depth_topic', '/camera/depth_registered/image_raw')
+        self.camera_info_topic = rospy.get_param('~camera_info_topic', '/camera/rgb/camera_info')
+        self.depth_scale = rospy.get_param('~depth_scale', 0.001)
+        self.camera_frame = rospy.get_param('~camera_frame', 'camera_rgb_optical_frame')
+        self.camera_info = None
+        self.current_color_shape = None
+        self.current_stamp = rospy.Time.now()
 
         # Mostrar por pantalla las funciones activadas
         print(colored(f'\nFunciones activadas:\n', 'yellow'))
@@ -123,37 +137,83 @@ class MediapipeStreaming:
         self.hand_left_pub  = rospy.Publisher('/mediapipe_gesture_recognition/left_hand', Hand, queue_size=1)
         self.pose_pub       = rospy.Publisher('/mediapipe_gesture_recognition/pose', Pose, queue_size=1)
         self.face_pub       = rospy.Publisher('/mediapipe_gesture_recognition/face', Face, queue_size=1)
+        if self.publish_debug_image:
+            self.debug_image_pub = rospy.Publisher('/mediapipe_gesture_recognition/debug_image', Image, queue_size=1)
 
         # Configurar la entrada de video usando los tópicos de Kinect
-        rospy.loginfo(f"Sincronizando imágenes de color y profundidad desde el tópico: {self.input_topic}...")
+        rospy.loginfo(f"Sincronizando RGB ({self.input_topic}) y depth ({self.depth_topic})...")
+        published_topics = dict(rospy.get_published_topics())
+        if self.input_topic not in published_topics:
+            rospy.logwarn(f"No se está publicando el tópico RGB configurado: {self.input_topic}")
+        if self.depth_topic not in published_topics:
+            rospy.logwarn(f"No se está publicando el tópico depth configurado: {self.depth_topic}")
         
         # Suscriptores a los tópicos de la Kinect
         self.image_sub = message_filters.Subscriber(self.input_topic, CompressedImage)
-        self.depth_sub = message_filters.Subscriber('/camera/depth/image_raw', Image)
+        self.depth_sub = message_filters.Subscriber(self.depth_topic, Image)
+        self.camera_info_sub = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.camera_info_callback)
         
         # Sincronizador de tiempo aproximado (tolera un pequeño desfase temporal)
-        self.ts = message_filters.ApproximateTimeSynchronizer([self.image_sub, self.depth_sub], queue_size=10, slop=0.1)
+        sync_queue_size = rospy.get_param('~sync_queue_size', 2)
+        sync_slop = rospy.get_param('~sync_slop', 0.05)
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [self.image_sub, self.depth_sub], queue_size=sync_queue_size, slop=sync_slop)
         self.ts.registerCallback(self.callback_ros)
             
         # Inicializar los modelos de MediaPipe
         self.initMediaPipeSolutions()
 
+    def camera_info_callback(self, msg):
+        """Guarda la calibración de la cámara RGB publicada por ROS."""
+        if len(msg.K) == 9 and msg.K[0] > 0 and msg.K[4] > 0:
+            self.camera_info = msg
+
     def callback_ros(self, rgb_msg, depth_msg):
         try:
-            rospy.loginfo_once("¡Primer fotograma recibido correctamente!")
-            
             # Extraer la imagen de color
             image_color = self.bridge.compressed_imgmsg_to_cv2(rgb_msg, "bgr8")
             
             # Extraer la imagen de profundidad
             self.current_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+            self.current_depth_encoding = depth_msg.encoding
+            if self.current_depth_image.ndim != 2:
+                raise ValueError('La imagen de profundidad no es monocanal')
+            self.current_color_shape = image_color.shape[:2]
+            self.current_stamp = rgb_msg.header.stamp
+            if not rgb_msg.header.stamp:
+                self.current_stamp = rospy.Time.now()
             
             # MediaPipe requiere las imágenes en formato RGB en lugar de BGR
             image_rgb = cv2.cvtColor(image_color, cv2.COLOR_BGR2RGB)
-            self.processResults(image_rgb)
-            
+            rospy.loginfo_once("¡Primer fotograma RGB-D recibido correctamente!")
         except Exception as e:
-            rospy.logwarn(f"Fotograma corrupto saltado. Error de CvBridge: {e}")
+            rospy.logerr_throttle(5.0, f"Error convirtiendo el fotograma RGB-D: {e}")
+            return
+
+        try:
+            self.processResults(image_rgb)
+        except Exception as e:
+            rospy.logerr_throttle(5.0, f"Error ejecutando MediaPipe/publicando resultados: {e}")
+            rospy.logerr_throttle(5.0, traceback.format_exc())
+
+        if self.publish_debug_image:
+            try:
+                self.debug_frame_count += 1
+                if self.debug_frame_count % self.debug_every_n_frames != 0:
+                    return
+
+                # El debug se reduce y se publica con menor frecuencia para no
+                # bloquear el procesamiento de los frames de control.
+                debug_image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+                if self.debug_scale < 1.0:
+                    debug_image = cv2.resize(
+                        debug_image, None, fx=self.debug_scale, fy=self.debug_scale,
+                        interpolation=cv2.INTER_AREA)
+                debug_msg = self.bridge.cv2_to_imgmsg(debug_image, encoding='bgr8')
+                debug_msg.header = rgb_msg.header
+                self.debug_image_pub.publish(debug_msg)
+            except Exception as e:
+                rospy.logerr_throttle(5.0, f"Error publicando imagen debug: {e}")
 
     def initMediaPipeSolutions(self):
         """ Inicializa los módulos de MediaPipe con sus parámetros configurables """
@@ -163,11 +223,11 @@ class MediapipeStreaming:
 
         # Parámetros del modelo Holistic
         static_image_mode        = rospy.get_param('/holistic/static_image_mode', False)
-        model_complexity         = rospy.get_param('/holistic/model_complexity', 1)
+        model_complexity         = rospy.get_param('~model_complexity', 0)
         smooth_landmarks         = rospy.get_param('/holistic/smooth_landmarks', True)
         enable_segmentation      = rospy.get_param('/holistic/enable_segmentation', False)
         smooth_segmentation      = rospy.get_param('/holistic/smooth_segmentation', True)
-        refine_face_landmarks    = rospy.get_param('/holistic/refine_face_landmarks', True)
+        refine_face_landmarks    = rospy.get_param('~refine_face_landmarks', False)
         min_detection_confidence = rospy.get_param('/holistic/min_detection_confidence', 0.5)
         min_tracking_confidence  = rospy.get_param('/holistic/min_tracking_confidence', 0.5)
 
@@ -215,21 +275,22 @@ class MediapipeStreaming:
         # --- EXTRACCIÓN DE PROFUNDIDAD Y CONVERSIÓN A METROS ---
         if hasattr(self, 'current_depth_image'):
             # Se saca la resolución de la imagen (suele ser 480x640)
-            height, width = self.current_depth_image.shape
+            depth_height, depth_width = self.current_depth_image.shape
+            color_height, color_width = self.current_color_shape
             
             # Convertir coordenadas normalizadas (0-1) a píxeles
-            px = int(landmark.x * width)
-            py = int(landmark.y * height)
+            px = int(landmark.x * depth_width)
+            py = int(landmark.y * depth_height)
             
             # Limitar dentro de los márgenes de la imagen
-            px = max(0, min(px, width - 1))
-            py = max(0, min(py, height - 1))
+            px = max(0, min(px, depth_width - 1))
+            py = max(0, min(py, depth_height - 1))
             
             # --- CORRECCIÓN DE RUIDO DE BORDE (PARALLAX) ---
             # En lugar de leer un solo píxel (que en el codo suele fallar y dar la profundidad de la pared de fondo),
             # extraemos una ventana de 5x5 alrededor del punto y tomamos la mediana de los valores válidos.
-            min_y, max_y = max(0, py - 2), min(height, py + 3)
-            min_x, max_x = max(0, px - 2), min(width, px + 3)
+            min_y, max_y = max(0, py - 2), min(depth_height, py + 3)
+            min_x, max_x = max(0, px - 2), min(depth_width, px + 3)
             window = self.current_depth_image[min_y:max_y, min_x:max_x]
             
             valid_depths = window[window > 0]
@@ -239,19 +300,27 @@ class MediapipeStreaming:
             else:
                 depth_val = 0
             
-            # Convertir milímetros a metros y aplicar modelo Pinhole
+            # Convertir la profundidad a metros según el encoding de ROS.
             if depth_val > 0:
-                z_m = float(depth_val) / 1000.0
+                depth_encoding = getattr(self, 'current_depth_encoding', '')
+                scale = 1.0 if depth_encoding == '32FC1' else self.depth_scale
+                z_m = float(depth_val) * scale
                 new_keypoint.depth = z_m
                 
-                # Parámetros ópticos aproximados de Kinect (para 640x480)
-                # TODO: En el futuro, suscribirse a /camera/rgb/camera_info
-                fx, fy = 525.0, 525.0
-                cx, cy = 320.0, 240.0
+                if self.camera_info is None:
+                    rospy.logwarn_throttle(5.0, 'Esperando CameraInfo; no se publican coordenadas 3D.')
+                    new_keypoint.depth = 0.0
+                    return new_keypoint
+
+                info = self.camera_info
+                scale_x = color_width / float(info.width) if info.width else 1.0
+                scale_y = color_height / float(info.height) if info.height else 1.0
+                fx, fy = info.K[0] * scale_x, info.K[4] * scale_y
+                cx, cy = info.K[2] * scale_x, info.K[5] * scale_y
                 
                 # Ecuación estenopeica (Pinhole camera model) para obtener X, Y en metros
-                u = landmark.x * width
-                v = landmark.y * height
+                u = landmark.x * color_width
+                v = landmark.y * color_height
                 new_keypoint.x = (u - cx) * z_m / fx
                 new_keypoint.y = (v - cy) * z_m / fy
                 new_keypoint.z = z_m
@@ -275,8 +344,8 @@ class MediapipeStreaming:
 
         # Construir mensaje de la mano para ROS
         hand_msg = Hand()
-        hand_msg.header.stamp = rospy.Time.now()
-        hand_msg.header.frame_id = 'Hand Right Message' if RightLeft else 'Hand Left Message'
+        hand_msg.header.stamp = self.current_stamp
+        hand_msg.header.frame_id = self.camera_frame
         hand_msg.right_or_left = hand_msg.RIGHT if RightLeft else hand_msg.LEFT
 
         # Comprobar si hay resultados para la mano indicada
@@ -303,14 +372,16 @@ class MediapipeStreaming:
             landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style())
 
         pose_msg = Pose()
-        pose_msg.header.stamp = rospy.Time.now()
-        pose_msg.header.frame_id = 'Pose Message'
+        pose_msg.header.stamp = self.current_stamp
+        pose_msg.header.frame_id = self.camera_frame
 
         if poseResults.pose_landmarks:
             for i in range(len(poseResults.pose_landmarks.landmark)):
                 pose_msg.keypoints.append(self.newKeypoint(poseResults.pose_landmarks.landmark[i], i+1, self.pose_landmarks_names[i]))
 
             self.pose_pub.publish(pose_msg)
+        else:
+            rospy.logwarn_throttle(5.0, 'MediaPipe no ha detectado ninguna pose en el fotograma.')
 
     def processFace(self, faceResults:HolisticResults, image:cv2.typing.MatLike) -> Optional[Face]:
 
@@ -324,8 +395,8 @@ class MediapipeStreaming:
             connection_drawing_spec=self.face_mesh_connection_drawing_spec)
 
         face_msg = Face()
-        face_msg.header.stamp = rospy.Time.now()
-        face_msg.header.frame_id = 'Face Message'
+        face_msg.header.stamp = self.current_stamp
+        face_msg.header.frame_id = self.camera_frame
 
         if faceResults.face_landmarks:
             for i in range(len(faceResults.face_landmarks.landmark)):
