@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 
-"""Mapea el movimiento relativo del brazo humano al espacio de mando.
+"""
+===============================================================================
+SISTEMA DE VISIÓN ARTIFICIAL RGB-D Y CONTROL ROBÓTICO
+===============================================================================
 
-El hombro humano y la base del robot comparten el origen `(0, 0, 0)`.
-No se usa la posicion absoluta ni la orientacion fisica del robot.
+
+NODO DE TRANSFORMACIÓN DE COORDENADAS
+
+Descripción General:
+
+Este nodo recibe la pose 3D publicada por `Stream_node.py` en
+`/mediapipe_gesture_recognition/pose`. Usa el hombro derecho como origen,
+transforma los ejes de la cámara al sistema de coordenadas del robot y publica
+la pose relativa en `/brazo`.
+
+Los puntos se mantienen en metros. Se conservan el hombro, codo, muñeca,
+meñique, índice y pulgar derechos para que los nodos de cinemática puedan
+calcular los cinco comandos de los servos.
+
 """
 
 import math
@@ -14,6 +29,7 @@ from mediapipe_gesture_recognition.msg import Keypoint, Pose  # type: ignore
 
 class TransfCoordNode:
     RIGHT_SHOULDER = 13
+    RIGHT_ELBOW = 15
     RIGHT_WRIST = 17
 
     def __init__(self):
@@ -59,9 +75,10 @@ class TransfCoordNode:
             return
         shoulder = points[self.RIGHT_SHOULDER]
 
-        if self.require_wrist and self.RIGHT_WRIST not in points:
+        if (self.RIGHT_ELBOW not in points
+                or (self.require_wrist and self.RIGHT_WRIST not in points)):
             rospy.logwarn_throttle(
-                5.0, 'Pose descartada: muneca derecha sin coordenadas 3D validas.')
+                5.0, 'Pose descartada: muneca o codo derechos sin coordenadas 3D validas.')
             return
 
         output = Pose()

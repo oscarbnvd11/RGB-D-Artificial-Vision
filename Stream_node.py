@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 
 """
--------------------------------------------------------------------------------
+===============================================================================
 SISTEMA DE VISIÓN ARTIFICIAL RGB-D Y CONTROL ROBÓTICO
--------------------------------------------------------------------------------
+===============================================================================
+
+
+NODO DE PERCEPCION RGB-D DEL PROYECTO
+ 
 Descripción General:
-Este script implementa un nodo de ROS que procesa imágenes RGB y de profundidad 
-(Depth) provenientes de una cámara Kinect. Utiliza la librería MediaPipe para 
-detectar y extraer puntos clave (keypoints) anatómicos, como la postura corporal, 
-manos y rostro. A cada punto detectado en 2D se le asigna su profundidad real en 
-metros obtenida del sensor de profundidad de la cámara.
 
-El código está estructurado en secciones para facilitar su futura expansión con 
-las siguientes etapas:
+Este nodo recibe las imagenes RGB y profundidad sincronizadas de la camara,
+ejecuta MediaPipe y publica los puntos de la postura en `/mediapipe_gesture_recognition/pose`. 
+Los puntos incluyen coordenadas 3D en metros calculadas con la profundidad 
+registrada y la calibracion de la camara.
 
-1. IMPORTACIÓN DE LIBRERÍAS: Importa las librerías necesarias para el funcionamiento del script.
-2. CAPTURA Y PROCESAMIENTO (MediaPipe Streaming): Sincroniza imágenes, ejecuta 
-   MediaPipe y extrae coordenadas (X, Y, Z) de los puntos clave.
-3. TRANSFORMACIÓN DE COORDENADAS (Próximamente): Convertirá las coordenadas de 
-   la cámara al sistema de referencia del robot.
-4. CINEMÁTICA INVERSA (Próximamente): Calculará los ángulos articulares para 
-   el movimiento del robot.
-5. ENVÍO DE DATOS POR SPI (Próximamente): Transmitirá los comandos de control 
-   a un microcontrolador externo.
-6. MAIN: Función principal que ejecuta el programa.
--------------------------------------------------------------------------------
+Flujo general del proyecto:
+1. `Openni_node.py` publica las imagenes RGB y profundidad de la camara en
+   `/camera/rgb/image_raw` y `/camera/depth/image_raw`.
+2. `Stream_Node.py` detecta la postura y publica la pose.
+3. `Transf_Coord_Node.py` toma el hombro derecho como origen y transforma los
+    ejes de la camara al sistema del robot, publicando `/brazo`.
+4. Se ejecuta una sola opcion de cinematica: `CI_desacoplada_node.py` o
+    `CI_completa_node.py`. Ambas publican `[q1, q2, q3, q4, q5]` en
+    `/robot/joint_angles`.
+5. `SPI_node.py` transmite los angulos de articulacion al Arduino por SPI.
+6. Arduino. Ejecuta los movimientos de los motores. **Por hacer**
+
 """
 
 # ==============================================================================
-# 1. IMPORTACIÓN DE LIBRERÍAS
+#  IMPORTACIÓN DE LIBRERÍAS
 # ==============================================================================
 import message_filters # type: ignore
 from cv_bridge import CvBridge # type: ignore
@@ -47,7 +49,7 @@ from mediapipe_gesture_recognition.msg import Pose, Face, Keypoint, Hand # type:
 from utils.mediapipe_types import NormalizedLandmark, HolisticResults, DetectionResult, ObjectronResults # type: ignore
 
 # ==============================================================================
-# 2. CAPTURA Y PROCESAMIENTO (MEDIAPIPE STREAMING NODE)
+#  CAPTURA Y PROCESAMIENTO (MEDIAPIPE STREAMING NODE)
 # ==============================================================================
 class MediapipeStreaming:
 
@@ -441,28 +443,7 @@ class MediapipeStreaming:
         if self.enable_objectron:      self.processObjectron(objectron_results, image)
 
 # ==============================================================================
-# 3. TRANSFORMACIÓN DE COORDENADAS (Próximamente)
-# ==============================================================================
-# TODO: Implementar la transformación de las coordenadas espaciales de la cámara
-# al sistema de coordenadas base del robot.
-
-
-# ==============================================================================
-# 4. CINEMÁTICA INVERSA (Próximamente)
-# ==============================================================================
-# TODO: Implementar el cálculo de los ángulos articulares necesarios para que 
-# el robot alcance las posiciones deseadas.
-
-
-# ==============================================================================
-# 5. ENVÍO DE DATOS POR SPI (Próximamente)
-# ==============================================================================
-# TODO: Implementar la comunicación por bus SPI para enviar las variables de 
-# control al microcontrolador esclavo.
-
-
-# ==============================================================================
-# 6. MAIN
+#  MAIN
 # ==============================================================================
 if __name__ == '__main__':
 
