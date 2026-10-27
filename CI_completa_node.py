@@ -25,9 +25,9 @@ codo, `q4` muñeca y `q5` pinza. De este modo publica comandos de servo y no
 angulos internos alternativos del triangulo geometrico.
 
 `q4` se calcula con el antebrazo real y la orientacion de muñeca-indice-
-meñique. `q5` usa la distancia real pulgar-indice: `0` grados abierta, `45`
-media y `90` cerrada. Los ultimos valores validos de `q4` y `q5` se
-conservan ante perdidas temporales.
+meñique. `q5` estima la apertura con la distancia tridimensional pulgar-indice:
+`0` grados abierta, `45` media y `90` cerrada. Los ultimos valores validos de
+`q4` y `q5` se conservan ante perdidas temporales.
 
 Este nodo es una de las dos opciones de cinematica del proyecto. No se debe
 ejecutar al mismo tiempo que `CI_desacoplada_node.py`.
@@ -35,6 +35,7 @@ ejecutar al mismo tiempo que `CI_desacoplada_node.py`.
 """
 
 import math
+from collections import deque
 
 import rospy  # type: ignore
 from mediapipe_gesture_recognition.msg import (  # type: ignore
@@ -73,11 +74,21 @@ class InverseKinematics5DOF:
             '~gripper_pitch_deg', 0.0)
         self.reach_epsilon = rospy.get_param('~reach_epsilon', 0.001)
         self.wrist_roll_reference_deg = rospy.get_param(
-            '~wrist_roll_reference_deg', 0.0)
+            '~wrist_roll_reference_deg', None)
+        self.wrist_roll_filter_alpha = rospy.get_param(
+            '~wrist_roll_filter_alpha', 0.2)
+        self.wrist_roll_initialized = False
+        self.filtered_wrist_roll_deg = 0.0
+        self.wrist_roll_samples = deque(maxlen=5)
         self.gripper_open_threshold = rospy.get_param(
-            '~gripper_open_threshold', 0.09)
+            '~gripper_open_threshold', 0.11)
         self.gripper_closed_threshold = rospy.get_param(
-            '~gripper_closed_threshold', 0.05)
+            '~gripper_closed_threshold', 0.07)
+        self.gripper_hysteresis_m = rospy.get_param(
+            '~gripper_hysteresis_m', 0.0)
+        self.gripper_distance_alpha = rospy.get_param(
+            '~gripper_distance_alpha', 0.25)
+        self.filtered_gripper_distance = None
         self.gripper_open_angle_deg = rospy.get_param(
             '~gripper_open_angle_deg', 0.0)
         self.gripper_half_angle_deg = rospy.get_param(
@@ -110,13 +121,85 @@ class InverseKinematics5DOF:
 
         thumb = self._coordinates(hand_points[self.RIGHT_THUMB])
         index = self._coordinates(hand_points[self.RIGHT_INDEX])
-        distance = self._length(self._subtract(thumb, index))
+        raw_distance = self._length(self._subtract(index, thumb))
 
-        if distance > self.gripper_open_threshold:
-            return self.gripper_open_angle_deg
-        if distance >= self.gripper_closed_threshold:
-            return self.gripper_half_angle_deg
-        return self.gripper_closed_angle_deg
+        if self.filtered_gripper_distance is None:
+            self.filtered_gripper_distance = raw_distance
+        else:
+            alpha = self.gripper_distance_alpha
+            self.filtered_gripper_distance = (
+                alpha * raw_distance
+                + (1.0 - alpha) * self.filtered_gripper_distance)
+        distance = self.filtered_gripper_distance
+        rospy.loginfo_throttle(
+            1.0,
+            'Pinza: distancia pulgar-indice %.1f mm (filtrada %.1f mm), '
+            'visibilidad pulgar %.2f, indice %.2f',
+            raw_distance * 1000.0,
+            distance * 1000.0,
+            hand_points[self.RIGHT_THUMB].v,
+            hand_points[self.RIGHT_INDEX].v)
+
+        open_angle = self.gripper_open_angle_deg
+        half_angle = self.gripper_half_angle_deg
+        closed_angle = self.gripper_closed_angle_deg
+        hysteresis = self.gripper_hysteresis_m
+        current_angle = self.latest_gripper_angle_deg
+
+        if current_angle == open_angle:
+            if distance <= self.gripper_closed_threshold - hysteresis:
+                return closed_angle
+            if distance <= self.gripper_open_threshold - hysteresis:
+                return half_angle
+            return open_angle
+        if current_angle == closed_angle:
+            if distance >= self.gripper_open_threshold + hysteresis:
+                return open_angle
+            if distance >= self.gripper_closed_threshold + hysteresis:
+                return half_angle
+            return closed_angle
+        if distance <= self.gripper_closed_threshold - hysteresis:
+            return closed_angle
+        if distance >= self.gripper_open_threshold + hysteresis:
+            return open_angle
+        return half_angle
+
+    def _filter_wrist_roll(self, measured_angle_deg):
+        if measured_angle_deg is None:
+            return None
+
+        if self.wrist_roll_reference_deg is None:
+            self.wrist_roll_reference_deg = measured_angle_deg
+            rospy.loginfo(
+                'Referencia de muñeca calibrada en %.1f grados',
+                measured_angle_deg)
+
+        relative_angle = self._wrap_degrees(
+            measured_angle_deg - self.wrist_roll_reference_deg)
+        if not self.wrist_roll_initialized:
+            self.wrist_roll_samples.append(relative_angle)
+            self.filtered_wrist_roll_deg = relative_angle
+            self.wrist_roll_initialized = True
+        else:
+            self.wrist_roll_samples.append(relative_angle)
+            aligned_angles = [
+                self.filtered_wrist_roll_deg
+                + self._wrap_degrees(
+                    sample - self.filtered_wrist_roll_deg)
+                for sample in self.wrist_roll_samples
+            ]
+            median_angle = sorted(aligned_angles)[
+                len(aligned_angles) // 2]
+            delta = self._wrap_degrees(
+                median_angle - self.filtered_wrist_roll_deg)
+            self.filtered_wrist_roll_deg = self._wrap_degrees(
+                self.filtered_wrist_roll_deg
+                + self.wrist_roll_filter_alpha * delta)
+        return self.filtered_wrist_roll_deg
+
+    @staticmethod
+    def _wrap_degrees(angle):
+        return (angle + 180.0) % 360.0 - 180.0
 
     def pose_callback(self, msg):
         points = {
@@ -185,8 +268,8 @@ class InverseKinematics5DOF:
         try:
             # q4 es un angulo: se calcula con el antebrazo humano real.
             forearm = elbow_wrist
-            wrist_roll_deg = self._calculate_wrist_roll(
-                points, forearm)
+            wrist_roll_deg = self._filter_wrist_roll(
+                self._calculate_wrist_roll(points, forearm))
             if wrist_roll_deg is not None:
                 self.latest_wrist_roll_deg = wrist_roll_deg
             wrist_roll_deg = self.latest_wrist_roll_deg
@@ -268,14 +351,14 @@ class InverseKinematics5DOF:
         return q_base, q_shoulder, q_elbow, q_wrist, q_gripper
     @classmethod
     def _calculate_joint_angles(cls, elbow, wrist):
-        """Devuelve los angulos de servo con el convenio desacoplado."""
+        """Devuelve angulos de servo; q3 va de flexionado a extendido."""
         a, b, c = elbow
         d, e, f = cls._subtract(wrist, elbow)
         radial_elbow = math.hypot(a, b)
         radial_wrist = math.hypot(d, e)
         q1 = math.atan2(b, a)
         q2 = math.atan2(c, radial_elbow)
-        q3 = math.atan2(f, radial_wrist) - q2
+        q3 = math.pi / 2.0 - (math.atan2(f, radial_wrist) - q2)
         return q1, q2, q3
 
     def _calculate_wrist_roll(self, hand_points, forearm):
@@ -310,7 +393,7 @@ class InverseKinematics5DOF:
         signed_angle = math.atan2(
             self._dot(forearm_axis, self._cross(reference, palm_normal)),
             self._dot(reference, palm_normal))
-        return math.degrees(signed_angle) - self.wrist_roll_reference_deg
+        return math.degrees(signed_angle)
 
     def _publish_scaled_pose(self, msg, points, scaled_coordinates):
         output = Pose()

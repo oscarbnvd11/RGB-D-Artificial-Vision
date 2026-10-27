@@ -23,8 +23,8 @@ Convenio de salida:
 `q1` base, `q2` hombro, `q3` codo, `q4` muñeca y `q5` pinza. Los tres primeros
 angulos se calculan de forma desacoplada a partir de las direcciones del codo
 y del antebrazo relativas al hombro. `q4` usa muñeca-indice-meñique y `q5`
-usa la distancia real pulgar-indice: `0` grados abierta, `45` media y `90`
-cerrada.
+estima la apertura a partir de la distancia pulgar-indice: `0` grados abierta,
+`45` media y `90` cerrada.
 
 Este nodo es una de las dos opciones de cinematica del proyecto. No se debe
 ejecutar al mismo tiempo que `CI_completa_node.py`.
@@ -59,11 +59,20 @@ class EscalaBrazoRobot:
             '~angle_output_topic', '/robot/joint_angles')
         self.output_frame = rospy.get_param('~output_frame', 'robot_base')
         self.wrist_roll_reference_deg = rospy.get_param(
-            '~wrist_roll_reference_deg', 0.0)
+            '~wrist_roll_reference_deg', None)
+        self.wrist_roll_filter_alpha = rospy.get_param(
+            '~wrist_roll_filter_alpha', 0.2)
+        self.wrist_roll_initialized = False
+        self.filtered_wrist_roll_deg = 0.0
         self.gripper_open_threshold = rospy.get_param(
-            '~gripper_open_threshold', 0.09)
+            '~gripper_open_threshold', 0.11)
         self.gripper_closed_threshold = rospy.get_param(
-            '~gripper_closed_threshold', 0.05)
+            '~gripper_closed_threshold', 0.07)
+        self.gripper_hysteresis_m = rospy.get_param(
+            '~gripper_hysteresis_m', 0.0)
+        self.gripper_distance_alpha = rospy.get_param(
+            '~gripper_distance_alpha', 0.25)
+        self.filtered_gripper_distance = None
         self.gripper_open_angle_deg = rospy.get_param(
             '~gripper_open_angle_deg', 0.0)
         self.gripper_half_angle_deg = rospy.get_param(
@@ -108,13 +117,76 @@ class EscalaBrazoRobot:
 
         thumb = self._coordinates(hand_points[self.RIGHT_THUMB])
         index = self._coordinates(hand_points[self.RIGHT_INDEX])
-        distance = self._length(self._subtract(thumb, index))
+        raw_distance = self._length(self._subtract(index, thumb))
 
-        if distance > self.gripper_open_threshold:
-            return self.gripper_open_angle_deg
-        if distance >= self.gripper_closed_threshold:
-            return self.gripper_half_angle_deg
-        return self.gripper_closed_angle_deg
+        if self.filtered_gripper_distance is None:
+            self.filtered_gripper_distance = raw_distance
+        else:
+            alpha = self.gripper_distance_alpha
+            self.filtered_gripper_distance = (
+                alpha * raw_distance
+                + (1.0 - alpha) * self.filtered_gripper_distance)
+        distance = self.filtered_gripper_distance
+        rospy.loginfo_throttle(
+            1.0,
+            'Pinza: distancia pulgar-indice %.1f mm (filtrada %.1f mm), '
+            'visibilidad pulgar %.2f, indice %.2f, q5 %.1f grados',
+            raw_distance * 1000.0,
+            distance * 1000.0,
+            hand_points[self.RIGHT_THUMB].v,
+            hand_points[self.RIGHT_INDEX].v,
+            self.latest_gripper_angle_deg)
+
+        open_angle = self.gripper_open_angle_deg
+        half_angle = self.gripper_half_angle_deg
+        closed_angle = self.gripper_closed_angle_deg
+        hysteresis = self.gripper_hysteresis_m
+        current_angle = self.latest_gripper_angle_deg
+
+        if current_angle == open_angle:
+            if distance <= self.gripper_closed_threshold - hysteresis:
+                return closed_angle
+            if distance <= self.gripper_open_threshold - hysteresis:
+                return half_angle
+            return open_angle
+        if current_angle == closed_angle:
+            if distance >= self.gripper_open_threshold + hysteresis:
+                return open_angle
+            if distance >= self.gripper_closed_threshold + hysteresis:
+                return half_angle
+            return closed_angle
+        if distance <= self.gripper_closed_threshold - hysteresis:
+            return closed_angle
+        if distance >= self.gripper_open_threshold + hysteresis:
+            return open_angle
+        return half_angle
+
+    def _filter_wrist_roll(self, measured_angle_deg):
+        if measured_angle_deg is None:
+            return None
+
+        if self.wrist_roll_reference_deg is None:
+            self.wrist_roll_reference_deg = measured_angle_deg
+            rospy.loginfo(
+                'Referencia de muñeca calibrada en %.1f grados',
+                measured_angle_deg)
+
+        relative_angle = self._wrap_degrees(
+            measured_angle_deg - self.wrist_roll_reference_deg)
+        if not self.wrist_roll_initialized:
+            self.filtered_wrist_roll_deg = relative_angle
+            self.wrist_roll_initialized = True
+        else:
+            delta = self._wrap_degrees(
+                relative_angle - self.filtered_wrist_roll_deg)
+            self.filtered_wrist_roll_deg = self._wrap_degrees(
+                self.filtered_wrist_roll_deg
+                + self.wrist_roll_filter_alpha * delta)
+        return self.filtered_wrist_roll_deg
+
+    @staticmethod
+    def _wrap_degrees(angle):
+        return (angle + 180.0) % 360.0 - 180.0
 
     def pose_callback(self, msg):
         points = {
@@ -209,8 +281,8 @@ class EscalaBrazoRobot:
         a, b, c = self._subtract(scaled_elbow, scaled_shoulder)
         d, e, f = self._subtract(scaled_wrist, scaled_elbow)
         q1, q2, q3 = self._calculate_joint_angles(a, b, c, d, e, f)
-        wrist_roll_deg = self._calculate_wrist_roll(
-            points, elbow_wrist)
+        wrist_roll_deg = self._filter_wrist_roll(
+            self._calculate_wrist_roll(points, elbow_wrist))
         if wrist_roll_deg is not None:
             self.latest_wrist_roll_deg = wrist_roll_deg
         q4 = self.latest_wrist_roll_deg
@@ -261,7 +333,7 @@ class EscalaBrazoRobot:
 
         q1 = math.atan2(b, a)
         q2 = math.atan2(c, radial_elbow)
-        q3 = math.atan2(f, radial_wrist) - q2
+        q3 = math.pi / 2.0 - (math.atan2(f, radial_wrist) - q2)
         return q1, q2, q3
 
     def _calculate_wrist_roll(self, hand_points, forearm):
@@ -295,7 +367,7 @@ class EscalaBrazoRobot:
         signed_angle = math.atan2(
             self._dot(forearm_axis, self._cross(reference, palm_normal)),
             self._dot(reference, palm_normal))
-        return math.degrees(signed_angle) - self.wrist_roll_reference_deg
+        return math.degrees(signed_angle)
 
     @staticmethod
     def _coordinates(point):

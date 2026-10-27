@@ -1,0 +1,20 @@
+<launch>
+  <arg name="ros_package"
+       default="mediapipe_gesture_recognition"
+       doc="Paquete catkin que contiene e instala los nodos Python del proyecto." />
+  <arg name="kinematics"
+       default="desacoplada"
+       doc="Alternativa de cinemática: desacoplada o completa." />
+  <arg name="ready_timeout"
+       default="180.0"
+       doc="Tiempo máximo en segundos para esperar cada confirmación." />
+
+  <node pkg="$(arg ros_package)"
+        type="launch_sequence.py"
+        name="rgbd_robot_launch_sequence"
+        output="screen">
+    <param name="ros_package" value="$(arg ros_package)" />
+    <param name="kinematics" value="$(arg kinematics)" />
+    <param name="ready_timeout" value="$(arg ready_timeout)" />
+  </node>
+</launch>

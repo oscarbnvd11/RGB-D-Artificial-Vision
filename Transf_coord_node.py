@@ -23,6 +23,10 @@ calcular los cinco comandos de los servos.
 
 import math
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import rospy  # type: ignore
 from mediapipe_gesture_recognition.msg import Keypoint, Pose  # type: ignore
 
@@ -69,17 +73,23 @@ class TransfCoordNode:
             and self._is_valid_point(kp)
         }
 
-        if self.RIGHT_SHOULDER not in points:
+        required_keypoints = [self.RIGHT_SHOULDER, self.RIGHT_ELBOW]
+        if self.require_wrist:
+            required_keypoints.append(self.RIGHT_WRIST)
+        missing_keypoints = [
+            keypoint_number
+            for keypoint_number in required_keypoints
+            if keypoint_number not in points
+        ]
+        if missing_keypoints:
             rospy.logwarn_throttle(
-                5.0, 'Pose descartada: hombro derecho sin coordenadas 3D validas.')
+                5.0,
+                'Pose descartada: keypoints derechos %s no detectados o sin '
+                'coordenadas 3D validas; comprueba profundidad registrada y '
+                'CameraInfo.',
+                missing_keypoints)
             return
         shoulder = points[self.RIGHT_SHOULDER]
-
-        if (self.RIGHT_ELBOW not in points
-                or (self.require_wrist and self.RIGHT_WRIST not in points)):
-            rospy.logwarn_throttle(
-                5.0, 'Pose descartada: muneca o codo derechos sin coordenadas 3D validas.')
-            return
 
         output = Pose()
         output.header.stamp = msg.header.stamp or rospy.Time.now()

@@ -23,6 +23,7 @@ volatile uint8_t frameQueue[FRAME_QUEUE_SIZE][FRAME_SIZE];
 volatile uint8_t queueHead = 0;
 volatile uint8_t queueTail = 0;
 volatile bool transactionEnded = false;
+volatile uint16_t receivedByteCount = 0;
 volatile uint16_t invalidFrameCount = 0;
 volatile uint16_t incompleteFrameCount = 0;
 volatile uint16_t queueOverflowCount = 0;
@@ -147,10 +148,6 @@ void updateServos() {
 
 void reportDiagnostics() {
   static uint32_t lastReport = 0;
-  static uint16_t lastInvalid = 0;
-  static uint16_t lastIncomplete = 0;
-  static uint16_t lastOverflow = 0;
-  static uint16_t lastAccepted = 0;
   if (millis() - lastReport < 1000) {
     return;
   }
@@ -160,35 +157,39 @@ void reportDiagnostics() {
   uint16_t incomplete;
   uint16_t overflow;
   uint16_t accepted;
+  uint16_t receivedBytes;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    receivedBytes = receivedByteCount;
     invalid = invalidFrameCount;
     incomplete = incompleteFrameCount;
     overflow = queueOverflowCount;
     accepted = acceptedFrameCount;
   }
 
-  if (invalid != lastInvalid
-      || incomplete != lastIncomplete
-      || overflow != lastOverflow
-      || accepted != lastAccepted) {
-    Serial.print(F("SPI validas="));
-    Serial.print(accepted);
-    Serial.print(F(" invalidas="));
-    Serial.print(invalid);
-    Serial.print(F(" incompletas="));
-    Serial.print(incomplete);
-    Serial.print(F(" cola_llena="));
-    Serial.println(overflow);
-    lastInvalid = invalid;
-    lastIncomplete = incomplete;
-    lastOverflow = overflow;
-    lastAccepted = accepted;
+  Serial.print(F("SPI bytes="));
+  Serial.print(receivedBytes);
+  Serial.print(F(" validas="));
+  Serial.print(accepted);
+  Serial.print(F(" invalidas="));
+  Serial.print(invalid);
+  Serial.print(F(" incompletas="));
+  Serial.print(incomplete);
+  Serial.print(F(" cola_llena="));
+  Serial.print(overflow);
+  Serial.print(F(" objetivos="));
+  for (uint8_t index = 0; index < SERVO_COUNT; ++index) {
+    if (index != 0) {
+      Serial.write(',');
+    }
+    Serial.print(targetPositions[index]);
   }
+  Serial.println();
 }
 }  // namespace
 
 ISR(SPI_STC_vect) {
   const uint8_t received = SPDR;
+  ++receivedByteCount;
   if (receiveLength < FRAME_SIZE) {
     receiveBuffer[receiveLength++] = received;
   }
@@ -215,6 +216,7 @@ ISR(PCINT0_vect) {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println(F("Arduino SPI servo iniciado; esperando tramas de 6 bytes"));
   for (uint8_t index = 0; index < SERVO_COUNT; ++index) {
     servos[index].attach(SERVO_PINS[index]);
     servos[index].write(initialPositions[index]);

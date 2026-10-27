@@ -8,7 +8,7 @@ import threading
 
 import rospy  # type: ignore
 import spidev  # type: ignore
-from std_msgs.msg import Float32MultiArray  # type: ignore
+from std_msgs.msg import Empty, Float32MultiArray  # type: ignore
 
 
 class SPIAngleTransmitter:
@@ -51,6 +51,8 @@ class SPIAngleTransmitter:
             self.input_topic,
             Float32MultiArray,
             self.angles_callback)
+        self.ready_pub = rospy.Publisher(
+            '/robot/spi_ready', Empty, queue_size=1, latch=True)
         rospy.on_shutdown(self.close)
         rospy.loginfo(
             'SPI listo: %s -> bus %s, dispositivo %s, modo %s, %s Hz',
@@ -59,6 +61,7 @@ class SPIAngleTransmitter:
             self.device,
             self.mode,
             self.speed_hz)
+        self.ready_pub.publish(Empty())
 
     @classmethod
     def encode_angles(cls, angles):

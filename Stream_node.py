@@ -18,14 +18,14 @@ registrada y la calibracion de la camara.
 Flujo general del proyecto:
 1. `Openni_node.py` publica las imagenes RGB y profundidad de la camara en
    `/camera/rgb/image_raw` y `/camera/depth/image_raw`.
-2. `Stream_Node.py` detecta la postura y publica la pose.
-3. `Transf_Coord_Node.py` toma el hombro derecho como origen y transforma los
+2. `Stream_node.py` detecta la postura y publica la pose.
+3. `Transf_coord_node.py` toma el hombro derecho como origen y transforma los
     ejes de la camara al sistema del robot, publicando `/brazo`.
 4. Se ejecuta una sola opcion de cinematica: `CI_desacoplada_node.py` o
     `CI_completa_node.py`. Ambas publican `[q1, q2, q3, q4, q5]` en
     `/robot/joint_angles`.
-5. `SPI_node.py` transmite los angulos de articulacion al Arduino por SPI.
-6. Arduino. Ejecuta los movimientos de los motores. **Por hacer**
+5. `SPI_node.py`. Envía los angulos de articulacion al robot por SPI. 
+6. Arduino. Ejecuta los movimientos de los motores.
 
 """
 
@@ -40,7 +40,11 @@ import traceback
 from termcolor import colored # type: ignore
 from typing import Optional
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image # type: ignore
+from std_msgs.msg import Empty  # type: ignore
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Importar módulos de MediaPipe
 from mediapipe.python.solutions import drawing_utils, drawing_styles, holistic, face_detection, objectron # type: ignore
 from mediapipe_gesture_recognition.msg import Pose, Face, Keypoint, Hand # type: ignore
@@ -119,6 +123,7 @@ class MediapipeStreaming:
         self.camera_info = None
         self.current_color_shape = None
         self.current_stamp = rospy.Time.now()
+        self.stream_ready = False
 
         # Mostrar por pantalla las funciones activadas
         print(colored(f'\nFunciones activadas:\n', 'yellow'))
@@ -139,6 +144,11 @@ class MediapipeStreaming:
         self.hand_left_pub  = rospy.Publisher('/mediapipe_gesture_recognition/left_hand', Hand, queue_size=1)
         self.pose_pub       = rospy.Publisher('/mediapipe_gesture_recognition/pose', Pose, queue_size=1)
         self.face_pub       = rospy.Publisher('/mediapipe_gesture_recognition/face', Face, queue_size=1)
+        self.stream_ready_pub = rospy.Publisher(
+            '/mediapipe_gesture_recognition/stream_ready',
+            Empty,
+            queue_size=1,
+            latch=True)
         if self.publish_debug_image:
             self.debug_image_pub = rospy.Publisher('/mediapipe_gesture_recognition/debug_image', Image, queue_size=1)
 
@@ -188,6 +198,9 @@ class MediapipeStreaming:
             # MediaPipe requiere las imágenes en formato RGB en lugar de BGR
             image_rgb = cv2.cvtColor(image_color, cv2.COLOR_BGR2RGB)
             rospy.loginfo_once("¡Primer fotograma RGB-D recibido correctamente!")
+            if not self.stream_ready:
+                self.stream_ready_pub.publish(Empty())
+                self.stream_ready = True
         except Exception as e:
             rospy.logerr_throttle(5.0, f"Error convirtiendo el fotograma RGB-D: {e}")
             return
