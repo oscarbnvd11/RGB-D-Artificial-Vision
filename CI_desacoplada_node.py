@@ -38,7 +38,7 @@ from mediapipe_gesture_recognition.msg import (  # type: ignore
     Keypoint,
     Pose,
 )
-from std_msgs.msg import Float32MultiArray  # type: ignore
+from std_msgs.msg import Float32MultiArray, Float64MultiArray  # type: ignore
 
 
 class EscalaBrazoRobot:
@@ -57,6 +57,7 @@ class EscalaBrazoRobot:
             '~output_topic', '/brazo_robot')
         self.angle_output_topic = rospy.get_param(
             '~angle_output_topic', '/robot/joint_angles')
+        self.medir_delay = rospy.get_param('~medir_delay', False)
         self.output_frame = rospy.get_param('~output_frame', 'robot_base')
         self.wrist_roll_reference_deg = rospy.get_param(
             '~wrist_roll_reference_deg', None)
@@ -97,8 +98,10 @@ class EscalaBrazoRobot:
 
         self.pose_pub = rospy.Publisher(
             self.output_topic, Pose, queue_size=1)
+        angle_message_type = (
+            Float64MultiArray if self.medir_delay else Float32MultiArray)
         self.angle_pub = rospy.Publisher(
-            self.angle_output_topic, Float32MultiArray, queue_size=1)
+            self.angle_output_topic, angle_message_type, queue_size=1)
         self.pose_sub = rospy.Subscriber(
             self.input_topic, Pose, self.pose_callback, queue_size=1)
 
@@ -310,20 +313,25 @@ class EscalaBrazoRobot:
 
         self.pose_pub.publish(output)
 
-        angles = Float32MultiArray()
-        angles.data = [
+        angle_values = [
             math.degrees(q1),
             math.degrees(q2),
             math.degrees(q3),
             q4,
             q5,
         ]
+        if self.medir_delay:
+            angles = Float64MultiArray()
+            angles.data = [msg.header.stamp.to_sec(), *angle_values]
+        else:
+            angles = Float32MultiArray()
+            angles.data = angle_values
         self.angle_pub.publish(angles)
 
         rospy.loginfo_throttle(
             2.0,
             'IK: q1=%.1f, q2=%.1f, q3=%.1f, q4=%.1f, pinza=%.1f grados',
-            *angles.data)
+            *angle_values)
 
     @staticmethod
     def _calculate_joint_angles(a, b, c, d, e, f):

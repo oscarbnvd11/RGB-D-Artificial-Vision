@@ -23,11 +23,14 @@ volatile uint8_t frameQueue[FRAME_QUEUE_SIZE][FRAME_SIZE];
 volatile uint8_t queueHead = 0;
 volatile uint8_t queueTail = 0;
 volatile bool transactionEnded = false;
-volatile uint16_t receivedByteCount = 0;
-volatile uint16_t invalidFrameCount = 0;
-volatile uint16_t incompleteFrameCount = 0;
-volatile uint16_t queueOverflowCount = 0;
-volatile uint16_t acceptedFrameCount = 0;
+volatile uint32_t receivedByteCount = 0;
+volatile uint32_t totalFrameCount = 0;
+volatile uint32_t validFrameCount = 0;
+volatile uint32_t checksumErrorFrameCount = 0;
+volatile uint32_t invalidFrameCount = 0;
+volatile uint32_t incompleteFrameCount = 0;
+volatile uint32_t queueOverflowCount = 0;
+volatile uint32_t acceptedFrameCount = 0;
 
 Servo servos[SERVO_COUNT];
 const int initialPositions[SERVO_COUNT] = {90, 90, 0, 90, 0};
@@ -148,34 +151,68 @@ void updateServos() {
 
 void reportDiagnostics() {
   static uint32_t lastReport = 0;
-  if (millis() - lastReport < 1000) {
+  static uint32_t previousTotalFrames = 0;
+  const uint32_t now = millis();
+  const uint32_t elapsed = now - lastReport;
+  if (elapsed < 1000) {
     return;
   }
-  lastReport = millis();
+  lastReport = now;
 
-  uint16_t invalid;
-  uint16_t incomplete;
-  uint16_t overflow;
-  uint16_t accepted;
-  uint16_t receivedBytes;
+  uint32_t total;
+  uint32_t valid;
+  uint32_t checksumErrors;
+  uint32_t invalid;
+  uint32_t incomplete;
+  uint32_t overflow;
+  uint32_t accepted;
+  uint32_t receivedBytes;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     receivedBytes = receivedByteCount;
+    total = totalFrameCount;
+    valid = validFrameCount;
+    checksumErrors = checksumErrorFrameCount;
     invalid = invalidFrameCount;
     incomplete = incompleteFrameCount;
     overflow = queueOverflowCount;
     accepted = acceptedFrameCount;
   }
 
-  Serial.print(F("SPI bytes="));
-  Serial.print(receivedBytes);
+  const uint32_t intervalFrames = total - previousTotalFrames;
+  previousTotalFrames = total;
+  const float framesPerSecond =
+      static_cast<float>(intervalFrames) * 1000.0f / elapsed;
+  const float validPercent = total == 0
+      ? 0.0f
+      : static_cast<float>(valid) * 100.0f / total;
+  const float checksumErrorPercent = total == 0
+      ? 0.0f
+      : static_cast<float>(checksumErrors) * 100.0f / total;
+
+  Serial.print(F("SPI t_s="));
+  Serial.print(now / 1000);
+  Serial.print(F(" total="));
+  Serial.print(total);
+  Serial.print(F(" fps="));
+  Serial.print(framesPerSecond, 1);
   Serial.print(F(" validas="));
-  Serial.print(accepted);
+  Serial.print(valid);
+  Serial.print(F(" validas_pct="));
+  Serial.print(validPercent, 1);
+  Serial.print(F(" checksum_err="));
+  Serial.print(checksumErrors);
+  Serial.print(F(" checksum_err_pct="));
+  Serial.print(checksumErrorPercent, 1);
   Serial.print(F(" invalidas="));
   Serial.print(invalid);
   Serial.print(F(" incompletas="));
   Serial.print(incomplete);
   Serial.print(F(" cola_llena="));
   Serial.print(overflow);
+  Serial.print(F(" encoladas="));
+  Serial.print(accepted);
+  Serial.print(F(" bytes="));
+  Serial.print(receivedBytes);
   Serial.print(F(" objetivos="));
   for (uint8_t index = 0; index < SERVO_COUNT; ++index) {
     if (index != 0) {
@@ -195,11 +232,17 @@ ISR(SPI_STC_vect) {
   }
 
   if (receiveLength == FRAME_SIZE) {
-    const bool valid = receiveBuffer[0] == FRAME_HEADER
+    ++totalFrameCount;
+    const bool checksumValid = hasValidChecksum(receiveBuffer);
+    const bool fieldsValid = receiveBuffer[0] == FRAME_HEADER
         && receiveBuffer[FRAME_SIZE - 1] == FRAME_FOOTER
-        && hasValidChecksum(receiveBuffer)
         && hasValidFields(receiveBuffer);
-    if (valid) {
+    if (!checksumValid) {
+      ++checksumErrorFrameCount;
+    }
+
+    if (checksumValid && fieldsValid) {
+      ++validFrameCount;
       enqueueReceivedFrame();
     } else {
       ++invalidFrameCount;

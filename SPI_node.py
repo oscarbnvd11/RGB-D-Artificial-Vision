@@ -8,7 +8,11 @@ import threading
 
 import rospy  # type: ignore
 import spidev  # type: ignore
-from std_msgs.msg import Empty, Float32MultiArray  # type: ignore
+from std_msgs.msg import (
+    Empty,
+    Float32MultiArray,
+    Float64MultiArray,
+)  # type: ignore
 
 
 class SPIAngleTransmitter:
@@ -20,6 +24,7 @@ class SPIAngleTransmitter:
 
         self.input_topic = rospy.get_param(
             '~input_topic', '/robot/joint_angles')
+        self.medir_delay = rospy.get_param('~medir_delay', False)
         self.bus = rospy.get_param('~spi_bus', 0)
         self.device = rospy.get_param('~spi_device', 0)
         self.speed_hz = rospy.get_param('~spi_speed_hz', 500000)
@@ -47,10 +52,15 @@ class SPIAngleTransmitter:
             daemon=True)
         self.sender_thread.start()
 
+        angle_message_type = (
+            Float64MultiArray if self.medir_delay else Float32MultiArray)
         self.angle_sub = rospy.Subscriber(
-            self.input_topic,
-            Float32MultiArray,
-            self.angles_callback)
+            self.input_topic, angle_message_type, self.angles_callback)
+        rospy.loginfo(
+            'Medicion de latencia %s; esperando %s en %s',
+            'activada' if self.medir_delay else 'desactivada',
+            angle_message_type.__name__,
+            self.input_topic)
         self.ready_pub = rospy.Publisher(
             '/robot/spi_ready', Empty, queue_size=1, latch=True)
         rospy.on_shutdown(self.close)
@@ -100,11 +110,41 @@ class SPIAngleTransmitter:
         return min(14, int(clamped / 6.0))
 
     def angles_callback(self, message):
+        start_time = None
+        angle_values = message.data
+        if self.medir_delay:
+            if len(message.data) != 6:
+                rospy.logwarn_throttle(
+                    5.0,
+                    'Vector de angulos invalido para medir_delay: '
+                    'se esperaba marca temporal y cinco angulos.')
+                return
+            start_time = message.data[0]
+            angle_values = message.data[1:]
+
         try:
-            frame = self.encode_angles(message.data)
+            frame = self.encode_angles(angle_values)
         except (TypeError, ValueError) as error:
             rospy.logwarn_throttle(5.0, 'Angulos descartados: %s', error)
             return
+
+        if start_time is not None:
+            if not math.isfinite(start_time) or start_time <= 0.0:
+                rospy.logwarn_throttle(
+                    5.0,
+                    'Marca temporal invalida; no se puede medir la latencia.')
+            else:
+                delay_ms = (rospy.Time.now().to_sec() - start_time) * 1000.0
+                if delay_ms < 0.0:
+                    rospy.logwarn_throttle(
+                        5.0,
+                        'La marca temporal esta en el futuro; comprueba '
+                        'la sincronizacion del reloj ROS.')
+                else:
+                    rospy.loginfo_throttle(
+                        1.0,
+                        'Latencia pose -> generacion de trama SPI: %.3f ms',
+                        delay_ms)
 
         self.frame_queue.put(frame)
 

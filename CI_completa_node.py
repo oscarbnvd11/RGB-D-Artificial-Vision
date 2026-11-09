@@ -42,7 +42,7 @@ from mediapipe_gesture_recognition.msg import (  # type: ignore
     Keypoint,
     Pose,
 )
-from std_msgs.msg import Float32MultiArray  # type: ignore
+from std_msgs.msg import Float32MultiArray, Float64MultiArray  # type: ignore
 
 
 class InverseKinematics5DOF:
@@ -59,6 +59,7 @@ class InverseKinematics5DOF:
         self.input_topic = rospy.get_param('~input_topic', '/brazo')
         self.angle_output_topic = rospy.get_param(
             '~angle_output_topic', '/robot/joint_angles')
+        self.medir_delay = rospy.get_param('~medir_delay', False)
         self.scaled_pose_topic = rospy.get_param(
             '~scaled_pose_topic', '/brazo_robot')
         self.output_frame = rospy.get_param('~output_frame', 'robot_base')
@@ -97,8 +98,10 @@ class InverseKinematics5DOF:
             '~gripper_closed_angle_deg', 90.0)
         self.latest_wrist_roll_deg = 0.0
         self.latest_gripper_angle_deg = 0.0
+        angle_message_type = (
+            Float64MultiArray if self.medir_delay else Float32MultiArray)
         self.joint_pub = rospy.Publisher(
-            self.angle_output_topic, Float32MultiArray, queue_size=1)
+            self.angle_output_topic, angle_message_type, queue_size=1)
         self.scaled_pose_pub = rospy.Publisher(
             self.scaled_pose_topic, Pose, queue_size=1)
         self.pose_sub = rospy.Subscriber(
@@ -296,14 +299,19 @@ class InverseKinematics5DOF:
             self.RIGHT_WRIST: scaled_wrist,
         })
 
-        output = Float32MultiArray()
-        output.data = [math.degrees(angle) for angle in angles]
+        angle_values = [math.degrees(angle) for angle in angles]
+        if self.medir_delay:
+            output = Float64MultiArray()
+            output.data = [msg.header.stamp.to_sec(), *angle_values]
+        else:
+            output = Float32MultiArray()
+            output.data = angle_values
         self.joint_pub.publish(output)
         rospy.loginfo_throttle(
             2.0,
             'IK -> q1 base %.1f, q2 hombro %.1f, '
             'q3 codo %.1f, q4 muneca %.1f, q5 pinza %.1f',
-            *output.data)
+            *angle_values)
 
     def solve(self, target, wrist_roll_deg=0.0, gripper_angle_deg=0.0):
         """Resuelve [q1 base, q2 hombro, q3 codo, q4 muneca, q5 pinza]."""

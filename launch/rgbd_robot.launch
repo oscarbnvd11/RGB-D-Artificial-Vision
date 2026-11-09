@@ -8,6 +8,15 @@
   <arg name="ready_timeout"
        default="180.0"
        doc="Tiempo máximo en segundos para esperar cada confirmación." />
+  <arg name="medir_delay"
+       default="false"
+       doc="Mide la latencia desde la detección de pose hasta generar la trama SPI." />
+  <arg name="parallax_filter_enabled"
+       default="true"
+       doc="Activa el filtro espacial 5x5 de profundidad en Stream_node.py." />
+  <arg name="z_diagnostics_enabled"
+       default="true"
+       doc="Muestra Z cruda/filtrada de muñeca y estadísticas de 50 frames." />
 
   <node pkg="$(arg ros_package)"
         type="launch_sequence.py"
@@ -16,5 +25,10 @@
     <param name="ros_package" value="$(arg ros_package)" />
     <param name="kinematics" value="$(arg kinematics)" />
     <param name="ready_timeout" value="$(arg ready_timeout)" />
+    <param name="medir_delay" value="$(arg medir_delay)" type="bool" />
+    <param name="parallax_filter_enabled"
+           value="$(arg parallax_filter_enabled)" type="bool" />
+    <param name="z_diagnostics_enabled"
+           value="$(arg z_diagnostics_enabled)" type="bool" />
   </node>
 </launch>

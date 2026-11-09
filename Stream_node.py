@@ -37,6 +37,7 @@ from cv_bridge import CvBridge # type: ignore
 import rospy, cv2  # type: ignore
 import numpy as np # type: ignore
 import traceback
+from collections import deque
 from termcolor import colored # type: ignore
 from typing import Optional
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image # type: ignore
@@ -73,6 +74,8 @@ class MediapipeStreaming:
 
     # Constantes
     RIGHT_HAND, LEFT_HAND = True, False
+    RIGHT_WRIST = 17
+    Z_DIAGNOSTICS_WINDOW = 50
 
     # Nombres de los puntos clave de la mano (Mediapipe hand)
     hand_landmarks_names = ['WRIST', 'THUMB_CMC', 'THUMB_MCP', 'THUMB_IP', 'THUMB_TIP', 'INDEX_FINGER_MCP',
@@ -106,6 +109,13 @@ class MediapipeStreaming:
         self.enable_face           = rospy.get_param('~enable_face', False)
         self.enable_face_detection = rospy.get_param('~enable_face_detection', False)
         self.enable_objectron      = rospy.get_param('~enable_objectron', False)
+        self.medir_delay           = rospy.get_param('~medir_delay', False)
+        self.parallax_filter_enabled = rospy.get_param(
+            '~parallax_filter_enabled', True)
+        self.z_diagnostics_enabled = rospy.get_param(
+            '~z_diagnostics_enabled', True)
+        self.raw_wrist_z_window = deque(maxlen=self.Z_DIAGNOSTICS_WINDOW)
+        self.filtered_wrist_z_window = deque(maxlen=self.Z_DIAGNOSTICS_WINDOW)
         self.objectron_model       = rospy.get_param('~objectron_model', 'Shoe')
         self.publish_debug_image   = rospy.get_param('~publish_debug_image', False)
         self.debug_every_n_frames  = max(1, rospy.get_param('~debug_every_n_frames', 5))
@@ -133,6 +143,12 @@ class MediapipeStreaming:
         print(colored(f'  Malla facial (Mediapipe face):  {self.enable_face}\n',      'green' if self.enable_face else 'red'))
         print(colored(f'  Objectron:       {self.enable_objectron}',        'green' if self.enable_objectron      else 'red'))
         print(colored(f'  Detección facial:  {self.enable_face_detection}\n', 'green' if self.enable_face_detection else 'red'))
+        rospy.loginfo(
+            'Filtro espacial de paralaje: %s; diagnostico Z de muñeca: %s '
+            '(ventana de %s frames)',
+            'activado' if self.parallax_filter_enabled else 'desactivado',
+            'activado' if self.z_diagnostics_enabled else 'desactivado',
+            self.Z_DIAGNOSTICS_WINDOW)
 
         # Comprobar si el modelo de Objectron es válido (aunque estará desactivado)
         if not self.objectron_model in self.available_objectron_models:
@@ -301,26 +317,38 @@ class MediapipeStreaming:
             px = max(0, min(px, depth_width - 1))
             py = max(0, min(py, depth_height - 1))
             
-            # --- CORRECCIÓN DE RUIDO DE BORDE (PARALLAX) ---
-            # En lugar de leer un solo píxel (que en el codo suele fallar y dar la profundidad de la pared de fondo),
-            # extraemos una ventana de 5x5 alrededor del punto y tomamos la mediana de los valores válidos.
+            # La medición cruda es el píxel central; el filtro usa la ventana 5x5.
             min_y, max_y = max(0, py - 2), min(depth_height, py + 3)
             min_x, max_x = max(0, px - 2), min(depth_width, px + 3)
             window = self.current_depth_image[min_y:max_y, min_x:max_x]
-            
-            valid_depths = window[window > 0]
+
+            raw_depth = self.current_depth_image[py, px]
+            valid_depths = window[np.isfinite(window) & (window > 0)]
             if len(valid_depths) > 0:
-                # Usamos el percentil 30 o la mediana para agarrarnos al brazo (más cercano) y evitar el fondo
-                depth_val = np.percentile(valid_depths, 30)
+                filtered_depth = np.percentile(valid_depths, 30)
             else:
-                depth_val = 0
-            
+                filtered_depth = 0
+
+            if self.parallax_filter_enabled:
+                depth_val = filtered_depth
+            else:
+                depth_val = raw_depth
+
             # Convertir la profundidad a metros según el encoding de ROS.
             if depth_val > 0:
                 depth_encoding = getattr(self, 'current_depth_encoding', '')
                 scale = 1.0 if depth_encoding == '32FC1' else self.depth_scale
                 z_m = float(depth_val) * scale
                 new_keypoint.depth = z_m
+
+                if (self.z_diagnostics_enabled
+                        and number == self.RIGHT_WRIST
+                        and name == 'RIGHT_WRIST'
+                        and np.isfinite(raw_depth)
+                        and raw_depth > 0
+                        and filtered_depth > 0):
+                    raw_z_m = float(raw_depth) * scale
+                    self._record_wrist_z(raw_z_m, z_m)
                 
                 if self.camera_info is None:
                     rospy.logwarn_throttle(5.0, 'Esperando CameraInfo; no se publican coordenadas 3D.')
@@ -345,6 +373,39 @@ class MediapipeStreaming:
         new_keypoint.keypoint_name = name
 
         return new_keypoint
+
+    def _record_wrist_z(self, raw_z_m: float, filtered_z_m: float) -> None:
+        """Guarda y muestra la Z cruda y filtrada de la muñeca derecha."""
+        self.raw_wrist_z_window.append(raw_z_m)
+        self.filtered_wrist_z_window.append(filtered_z_m)
+        rospy.loginfo_throttle(
+            1.0,
+            'Z muñeca [mm]: antes=%.1f despues=%.1f',
+            raw_z_m * 1000.0,
+            filtered_z_m * 1000.0)
+        if len(self.raw_wrist_z_window) < self.Z_DIAGNOSTICS_WINDOW:
+            return
+
+        raw_window_mm = np.asarray(self.raw_wrist_z_window) * 1000.0
+        filtered_window_mm = np.asarray(self.filtered_wrist_z_window) * 1000.0
+        raw_variance = float(np.var(raw_window_mm))
+        filtered_variance = float(np.var(filtered_window_mm))
+        variance_reduction = (
+            0.0 if raw_variance == 0.0
+            else (raw_variance - filtered_variance) / raw_variance * 100.0)
+        raw_range_mm = float(np.max(raw_window_mm) - np.min(raw_window_mm))
+        rospy.loginfo_throttle(
+            1.0,
+            'Estadisticas Z [mm/mm^2], ventana=%d: '
+            'cruda_min=%.1f cruda_max=%.1f salto=%.1f '
+            'var_cruda=%.2f var_salida=%.2f reduccion_var=%.1f%%',
+            self.Z_DIAGNOSTICS_WINDOW,
+            float(np.min(raw_window_mm)),
+            float(np.max(raw_window_mm)),
+            raw_range_mm,
+            raw_variance,
+            filtered_variance,
+            variance_reduction)
 
     def processHand(self, RightLeft:bool, handResults:HolisticResults, image:cv2.typing.MatLike) -> Optional[Hand]:
         """ Procesa y publica los keypoints de las manos """
@@ -442,6 +503,11 @@ class MediapipeStreaming:
 
         # Obtener resultados de MediaPipe
         holistic_results       = self.holistic.process(image)       if self.enable_right_hand or self.enable_left_hand or self.enable_pose or self.enable_face else None
+        if (self.medir_delay
+                and self.enable_pose
+                and holistic_results
+                and holistic_results.pose_landmarks):
+            self.current_stamp = rospy.Time.now()
         face_detection_results = self.face_detection.process(image) if self.enable_face_detection else None
         objectron_results      = self.objectron.process(image)      if self.enable_objectron else None
 

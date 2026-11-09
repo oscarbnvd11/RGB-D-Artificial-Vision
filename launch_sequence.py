@@ -6,7 +6,7 @@ import rospy  # type: ignore
 from roslaunch.core import Node, RLException  # type: ignore
 from roslaunch.scriptapi import ROSLaunch  # type: ignore
 from mediapipe_gesture_recognition.msg import Pose  # type: ignore
-from std_msgs.msg import Empty, Float32MultiArray  # type: ignore
+from std_msgs.msg import Empty, Float32MultiArray, Float64MultiArray  # type: ignore
 
 
 class LaunchSequence:
@@ -21,6 +21,11 @@ class LaunchSequence:
 
         self.package = rospy.get_param('~ros_package')
         self.kinematics = rospy.get_param('~kinematics', 'desacoplada')
+        self.medir_delay = rospy.get_param('~medir_delay', False)
+        self.parallax_filter_enabled = rospy.get_param(
+            '~parallax_filter_enabled', True)
+        self.z_diagnostics_enabled = rospy.get_param(
+            '~z_diagnostics_enabled', True)
         self.ready_timeout = rospy.get_param('~ready_timeout', 180.0)
         if self.kinematics not in ('desacoplada', 'completa'):
             raise ValueError(
@@ -54,7 +59,12 @@ class LaunchSequence:
             self._launch_node(
                 'Stream_node.py',
                 'mediapipe_stream_node',
-                '_enable_pose:=true')
+                '_enable_pose:=true _medir_delay:=%s '
+                '_parallax_filter_enabled:=%s _z_diagnostics_enabled:=%s'
+                % (
+                    str(self.medir_delay).lower(),
+                    str(self.parallax_filter_enabled).lower(),
+                    str(self.z_diagnostics_enabled).lower()))
             self._launch_node(
                 'Transf_coord_node.py',
                 'transf_coord_node')
@@ -66,8 +76,11 @@ class LaunchSequence:
                 kinematics_node = 'CI_desacoplada_node.py'
                 kinematics_name = 'ci_desacoplada_node'
 
-            self._launch_node(kinematics_node, kinematics_name)
-            self._launch_node('SPI_node.py', 'spi_node')
+            medir_delay_arg = '_medir_delay:=%s' % str(
+                self.medir_delay).lower()
+            self._launch_node(
+                kinematics_node, kinematics_name, medir_delay_arg)
+            self._launch_node('SPI_node.py', 'spi_node', medir_delay_arg)
             self._wait_for_message(
                 self.STREAM_READY_TOPIC,
                 Empty,
@@ -80,9 +93,12 @@ class LaunchSequence:
                 self.TRANSFORMED_POSE_TOPIC,
                 Pose,
                 'primera pose relativa válida')
+            angle_message_type = (
+                Float64MultiArray
+                if self.medir_delay else Float32MultiArray)
             self._wait_for_message(
                 self.JOINT_ANGLES_TOPIC,
-                Float32MultiArray,
+                angle_message_type,
                 'primer vector de ángulos articulares')
             self._wait_for_message(
                 self.SPI_READY_TOPIC,
